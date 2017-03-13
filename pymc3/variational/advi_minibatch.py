@@ -8,7 +8,7 @@ from theano.configparser import change_flags
 import tqdm
 
 import pymc3 as pm
-from pymc3.theanof import reshape_t, inputvars, floatX
+from pymc3.theanof import inputvars, floatX
 from .advi import ADVIFit, adagrad_optimizer, gen_random_state, infmean
 
 __all__ = ['advi_minibatch']
@@ -54,94 +54,31 @@ def _get_rvss(
     return local_RVs, observed_RVs
 
 
-def _init_uw_global_shared(start, global_RVs):
-    global_order = pm.ArrayOrdering([v for v in global_RVs])
-    start = {v.name: start[v.name] for v in global_RVs}
-    bij = pm.DictToArrayBijection(global_order, start)
-    u_start = bij.map(start)
-    w_start = np.zeros_like(u_start)
-    uw_start = floatX(np.concatenate([u_start, w_start]))
-    uw_global_shared = theano.shared(uw_start, 'uw_global_shared')
-
-    return uw_global_shared, bij
-
-
-def _join_global_RVs(global_RVs, global_order):
-    if len(global_RVs) == 0:
-        inarray_global = None
-        uw_global = None
-        replace_global = {}
-        c_g = 0
-    else:
-        joined_global = tt.concatenate([v.ravel() for v in global_RVs])
-        uw_global = tt.vector('uw_global')
-        uw_global.tag.test_value = np.concatenate(
-            [joined_global.tag.test_value, joined_global.tag.test_value]
-        )
-
-        inarray_global = joined_global.type('inarray_global')
-        inarray_global.tag.test_value = joined_global.tag.test_value
-
-        # Replace RVs with reshaped subvectors of the joined vector
-        # The order of global_order is the same with that of global_RVs
-        subvecs = [reshape_t(inarray_global[slc], shp).astype(dtyp)
-                   for _, slc, shp, dtyp in global_order.vmap]
-        replace_global = {v: subvec for v, subvec in zip(global_RVs, subvecs)}
-
-        # Weight vector
-        cs = [c for _, c in global_RVs.items()]
-        oness = [tt.ones(v.ravel().tag.test_value.shape) for v in global_RVs]
-        c_g = tt.concatenate([c * ones for c, ones in zip(cs, oness)])
-
-    return inarray_global, uw_global, replace_global, c_g
-
-
-def _join_local_RVs(local_RVs, local_order):
-    if len(local_RVs) == 0:
-        inarray_local = None
-        uw_local = None
-        replace_local = {}
-        c_l = 0
-    else:
-        joined_local = tt.concatenate([v.ravel() for v in local_RVs])
-        uw_local = tt.vector('uw_local')
-        uw_local.tag.test_value = np.concatenate([joined_local.tag.test_value,
-                                                  joined_local.tag.test_value])
-
-        inarray_local = joined_local.type('inarray_local')
-        inarray_local.tag.test_value = joined_local.tag.test_value
-
-        get_var = {var.name: var for var in local_RVs}
-        replace_local = {
-            get_var[var]: reshape_t(inarray_local[slc], shp).astype(dtyp)
-            for var, slc, shp, dtyp in local_order.vmap
-        }
-
-        # Weight vector
-        cs = [c for _, (_, c) in local_RVs.items()]
-        oness = [tt.ones(v.ravel().tag.test_value.shape) for v in local_RVs]
-        c_l = tt.concatenate([c * ones for c, ones in zip(cs, oness)])
-
-    return inarray_local, uw_local, replace_local, c_l
-
-
-def _make_logpt(global_RVs, local_RVs, observed_RVs, potentials):
-    """Return expression of log probability.
+def _init_vparams(start, rv):
+    """Initialize variational parameters with shared variables.
     """
-    # Scale log probability for mini-batches
-    factors = [c * v.logpt for v, c in observed_RVs.items()] + \
-              [c * v.logpt for v, c in global_RVs.items()] + \
-              [c * v.logpt for v, (_, c) in local_RVs.items()] + \
-              potentials
-    logpt = tt.add(*map(tt.sum, factors))
+    u_start = theano.shared(floatX(start[rv.name].ravel()),
+                            '{}_mean_shared'.format(rv.name))
+    w_start = theano.shared(floatX(np.zeros_like(u_start.get_value())),
+                            '{}_std_shared'.format(rv.name))
 
-    return logpt
+    return u_start, w_start
 
 
-def _elbo_t(
-    logp, uw_g, uw_l, inarray_g, inarray_l, c_g, c_l, n_mcsamples,
-    random_seed):
-    """Return expression of approximate ELBO based on Monte Carlo sampling.
+def _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed):
+    """Return expression of ELBO approximated with Monte Carlo sampling.
+
+    :param logp: Tensor of the log probability of the model.
+    :param uws: List of the mean and std of random variables.
+    :type uws: list of (tensor, tensor)
+    :param rvs: Tensors of random variables in the model.
+    :type rvs: list of tensor
+    :param shs: Shapes of random variables in the model.
+    :type shs: list of (tuple, ndarray or tensor)
+    :param int n_mcsamples: MC samples for approximation.
+    :param random_seed: Seed of rng.
+
+    TODO: implements weighting logp terms
     """
     if random_seed is None:
         r = MRG_RandomStreams(gen_random_state())
@@ -152,75 +89,29 @@ def _elbo_t(
 
     elbo = 0
 
-    # Sampling local variational parameters
-    if uw_l is not None:
-        l_l = (uw_l.size / 2).astype('int32')
-        u_l = uw_l[:l_l]
-        w_l = uw_l[l_l:]
-        ns_l = r.normal(size=(n_mcsamples, inarray_l.tag.test_value.shape[0]))
-        zs_l = ns_l * tt.exp(w_l) + u_l
-        elbo += tt.sum(c_l * (w_l + 0.5 * normal_const))
-    else:
-        zs_l = None
+    # Sampling rvs
+    ns = [r.normal(size=(n_mcsamples, tt.cumprod(sh)[-1])) for sh in shs]
+    zs = [n * tt.exp(uw[1].ravel()) + uw[0].ravel() for n, uw in zip(ns, uws)]
 
-    # Sampling global variational parameters
-    if uw_g is not None:
-        l_g = (uw_g.size / 2).astype('int32')
-        u_g = uw_g[:l_g]
-        w_g = uw_g[l_g:]
-        ns_g = r.normal(size=(n_mcsamples, inarray_g.tag.test_value.shape[0]))
-        zs_g = ns_g * tt.exp(w_g) + u_g
-        elbo += tt.sum(c_g * (w_g + 0.5 * normal_const))
-    else:
-        zs_g = None
+    # Compute constants for ELBO
+    elbo = tt.sum([tt.sum(uw[1] + 0.5 + normal_const) for uw in uws])
 
-    if (zs_l is not None) and (zs_g is not None):
-        def logp_(z_g, z_l):
-            return theano.clone(
-                logp, OrderedDict({inarray_g: z_g, inarray_l: z_l}),
-                strict=False
-            )
-        sequences = [zs_g, zs_l]
+    # Log probability
+    def logp_(*zs):
+        return theano.clone(
+            logp,
+            OrderedDict({rv: z.reshape(sh) for rv, z, sh in zip(rvs, zs, shs)}),
+            strict=False
+        )
 
-    elif zs_l is not None:
-        def logp_(z_l):
-            return theano.clone(
-                logp, OrderedDict({inarray_l: z_l}),
-                strict=False
-            )
-        sequences = [zs_l]
+    # Stack MC samples for each rvs
+    zss = [tt.stack([z[i] for i in range(n_mcsamples)]) for z in zs]
 
-    else:
-        def logp_(z_g):
-            return theano.clone(
-                logp, OrderedDict({inarray_g: z_g}),
-                strict=False
-            )
-        sequences = [zs_g]
-
-    logps, _ = theano.scan(fn=logp_, outputs_info=None, sequences=sequences)
+    # Compute ELBO
+    logps, _ = theano.scan(fn=logp_, outputs_info=None, sequences=zss)
     elbo += tt.mean(logps)
 
     return elbo
-
-
-def _make_elbo_t(
-    observed_RVs, global_RVs, local_RVs, potentials, n_mcsamples, random_seed):
-    global_order = pm.ArrayOrdering([v for v in global_RVs])
-    local_order = pm.ArrayOrdering([v for v in local_RVs])
-
-    inarray_g, uw_g, replace_g, c_g = _join_global_RVs(global_RVs, global_order)
-    inarray_l, uw_l, replace_l, c_l = _join_local_RVs(local_RVs, local_order)
-
-    logpt = _make_logpt(global_RVs, local_RVs, observed_RVs, potentials)
-    replace = replace_g
-    replace.update(replace_l)
-    logpt = theano.clone(logpt, replace, strict=False)
-
-    elbo = _elbo_t(logpt, uw_g, uw_l, inarray_g, inarray_l, c_g, c_l,
-                   n_mcsamples, random_seed)
-
-    return elbo, uw_l, uw_g
 
 
 @change_flags(compute_test_value='ignore')
@@ -479,42 +370,40 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
             )
         )
 
+    # Unknown random variables
+    rvs_global = [rv for rv in global_RVs.keys()]
+    uws_global = [_init_vparams(start, rv) for rv in global_RVs.keys()]
+    shs_global = [start[rv.name].shape for rv in global_RVs.keys()]
+    rvs_local = [rv for rv in local_RVs.keys()]
+    uws_local = [v[0] for v in local_RVs.values()]
+    shs_local = [v[0][0].shape for v in local_RVs.values()]
+    rvs = rvs_global + rvs_local
+    uws = uws_global + uws_local
+    shs = shs_global + shs_local
+
+    # Log probability
+    c = 1
+    factors = [c * rv.logpt for rv in rvs] + \
+              [c * rv.logpt for rv in observed_RVs] + \
+              model.potentials
+    logp = tt.add(*map(tt.sum, factors))
+
     # ELBO wrt variational parameters
-    elbo, uw_l, uw_g = _make_elbo_t(observed_RVs, global_RVs, local_RVs,
-                                    model.potentials, n_mcsamples, random_seed)
-
-    # Replacements tensors of variational parameters in the graph
-    replaces = dict()
-
-    # Variational parameters for global RVs
-    if 0 < len(global_RVs):
-        uw_global_shared, bij = _init_uw_global_shared(start, global_RVs)
-        replaces.update({uw_g: uw_global_shared})
-
-    # Variational parameters for local RVs, encoded from samples in
-    # mini-batches
-    if 0 < len(local_RVs):
-        uws = [uw for _, (uw, _) in local_RVs.items()]
-        uw_local_encoded = tt.concatenate([uw[0].ravel() for uw in uws] +
-                                          [uw[1].ravel() for uw in uws])
-        replaces.update({uw_l: uw_local_encoded})
-
-    # Replace tensors of variational parameters in ELBO
-    elbo = theano.clone(elbo, OrderedDict(replaces), strict=False)
+    elbo = _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed)
 
     # Replace input shared variables with tensors
     def is_shared(t):
         return isinstance(t, theano.compile.sharedvalue.SharedVariable)
     tensors = [(t.type() if is_shared(t) else t) for t in minibatch_tensors]
-    updates = OrderedDict(
+    replaces = OrderedDict(
         {t: t_ for t, t_ in zip(minibatch_tensors, tensors) if is_shared(t)}
     )
-    elbo = theano.clone(elbo, updates, strict=False)
+    elbo = theano.clone(elbo, replaces, strict=False)
 
     # Create parameter update function used in the training loop
-    params = encoder_params
-    if 0 < len(global_RVs):
-        params += [uw_global_shared]
+    params = encoder_params + \
+             [uw[0] for uw in uws_global] + \
+             [uw[1] for uw in uws_global]
     updates = OrderedDict(optimizer(loss=-1 * elbo, param=params))
     f = theano.function(tensors, elbo, updates=updates, mode=mode)
 
@@ -535,15 +424,9 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     pm._log.info('Finished minibatch ADVI: ELBO = {:,.2f}'.format(elbos[-1]))
 
     # Variational parameters of global RVs
-    if 0 < len(global_RVs):
-        l = int(uw_global_shared.get_value(borrow=True).size / 2)
-        u = bij.rmap(uw_global_shared.get_value(borrow=True)[:l])
-        w = bij.rmap(uw_global_shared.get_value(borrow=True)[l:])
-        # w is in log space
-        for var in w.keys():
-            w[var] = np.exp(w[var])
-    else:
-        u = dict()
-        w = dict()
+    us = OrderedDict([(rv.name, uw[0].get_value().copy())
+                      for rv, uw in zip(rvs_global, uws_global)])
+    ws = OrderedDict([(rv.name, uw[1].get_value().copy())
+                      for rv, uw in zip(rvs_global, uws_global)])
 
-    return ADVIFit(u, w, elbos)
+    return ADVIFit(us, ws, elbos)
