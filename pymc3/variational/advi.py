@@ -384,7 +384,7 @@ def sample_vp(
             w = uw[1].ravel()
             n = r.normal(size=u.tag.test_value.shape)
             updates.update(
-                {v: (n * tt.exp(w) + u).reshape(v.tag.test_value.shape)})
+                {v: (n * w + u).reshape(v.tag.test_value.shape)})
 
     # Replace some nodes of the graph with variational distributions
     vars = model.free_RVs

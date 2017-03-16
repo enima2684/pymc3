@@ -1,5 +1,5 @@
 from collections import OrderedDict
-
+from itertools import chain
 import numpy as np
 import theano
 import theano.tensor as tt
@@ -13,6 +13,9 @@ from .advi import ADVIFit, adagrad_optimizer, gen_random_state, infmean
 
 __all__ = ['advi_minibatch']
 
+
+def _flatten(l):
+    return list(chain.from_iterable(l))
 
 def _value_error(cond, str):
     if not cond:
@@ -65,7 +68,10 @@ def _init_vparams(start, rv):
     return u_start, w_start
 
 
-def _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed):
+def shprod(sh):
+    return 1 if sh == () else tt.prod(sh)
+
+def _elbo_t(logp, uws, rvs, shs, scs, n_mcsamples, random_seed):
     """Return expression of ELBO approximated with Monte Carlo sampling.
 
     :param logp: Tensor of the log probability of the model.
@@ -75,10 +81,10 @@ def _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed):
     :type rvs: list of tensor
     :param shs: Shapes of random variables in the model.
     :type shs: list of (tuple, ndarray or tensor)
+    :param scs: Scale constants for the terms in ELBO.
+    :type scs: list of scalar
     :param int n_mcsamples: MC samples for approximation.
     :param random_seed: Seed of rng.
-
-    TODO: implements weighting logp terms
     """
     if random_seed is None:
         r = MRG_RandomStreams(gen_random_state())
@@ -87,14 +93,13 @@ def _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed):
 
     normal_const = floatX(1 + np.log(2.0 * np.pi))
 
-    elbo = 0
-
     # Sampling rvs
-    ns = [r.normal(size=(n_mcsamples, tt.cumprod(sh)[-1])) for sh in shs]
+    ns = [r.normal(size=(n_mcsamples, shprod(sh))) for sh in shs]
     zs = [n * tt.exp(uw[1].ravel()) + uw[0].ravel() for n, uw in zip(ns, uws)]
 
     # Compute constants for ELBO
-    elbo = tt.sum([tt.sum(uw[1] + 0.5 + normal_const) for uw in uws])
+    elbo = tt.sum([sc * tt.sum(uw[1].ravel() + 0.5 * normal_const)
+                   for sc, uw in zip(scs, uws)])
 
     # Log probability
     def logp_(*zs):
@@ -114,13 +119,36 @@ def _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed):
     return elbo
 
 
+def apply_normalizing_flows(zs, rvs, normalizing_flows, elbo=None):
+    zs_new = OrderedDict([(rv.name, z) for rv, z in zip(rvs, zs)])
+    elbo_new = elbo
+
+    for nf in normalizing_flows:
+        zs_org = [zs_new[rv.name] for rv in nf[0]]
+        zs_trn = nf[1].trans(*zs_org)
+        zs_new.update(
+            OrderedDict(
+                [(rv.name, z_trn) for rv, z_trn in zip(nf[0], zs_trn)]
+            )
+        )
+        if elbo_new is not None:
+            elbo_new += nf[1].ldj(*zs_org)
+
+    nf_params = _flatten([nf[1].get_params() for nf in normalizing_flows])
+
+    if elbo is not None:
+        return list(zs_new), nf_params, elbo_new
+    else:
+        return list(zs_new), nf_params
+
+
 @change_flags(compute_test_value='ignore')
 def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
                    minibatch_RVs=None, minibatch_tensors=None,
                    minibatches=None, global_RVs=None, local_RVs=None,
                    observed_RVs=None, encoder_params=None, total_size=None,
                    optimizer=None, learning_rate=.001, epsilon=.1,
-                   random_seed=None, mode=None):
+                   normalizing_flows=None, random_seed=None, mode=None):
     """Perform mini-batch ADVI.
 
     This function implements a mini-batch automatic differentiation variational
@@ -250,6 +278,28 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     parameters of the global variables, :math:`\gamma`, because these are
     automatically created and updated in this function.
 
+    TODO: fix description below
+
+    :code:`normalizing_flows` is a list of the form
+    :code:`(rvs, trans, ldj, params)`, where :code:`rvs` is a list of random
+    variables defined in the model. :code:`trans` is a function that implements
+    a transform: :code:`trans(zs) -> zs_trans`, where
+    :code:`[z.shape == z_trans.shape for z, z_trans in zip(zs, zs_trans)]`
+    is :code:`True` for all elements (RVs).
+    :code:`ldj` is a function that returns the expression of the log determinant
+    given :code:`zss`. :code:`params` is the parameters of the transform.
+    Normalizing flows are applied as follows:
+
+    .. code:: python
+
+        for nf in normalizing_flows:
+            zs_ = zs_dict[rvs[rv.name] for rv in nf[0]]
+            zs_trans = nf[1](*zs_)
+            elbo += nf[2](*zs_)
+            for rv, z_trans in zip(nf[0], zs_trans):
+                zs_dict[rv.name] = 
+            optimized_params += nf[3]
+
     The following is a list of example notebooks using advi_minibatch:
 
     - docs/source/notebooks/GLM-hierarchical-advi-minibatch.ipynb
@@ -370,26 +420,28 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
             )
         )
 
-    # Unknown random variables
+    # Unobserved random variables
     rvs_global = [rv for rv in global_RVs.keys()]
     uws_global = [_init_vparams(start, rv) for rv in global_RVs.keys()]
     shs_global = [start[rv.name].shape for rv in global_RVs.keys()]
+    scs_global = [1 for rv in global_RVs.keys()]
     rvs_local = [rv for rv in local_RVs.keys()]
     uws_local = [v[0] for v in local_RVs.values()]
     shs_local = [v[0][0].shape for v in local_RVs.values()]
+    scs_local = [v[1] for v in local_RVs.values()]
     rvs = rvs_global + rvs_local
     uws = uws_global + uws_local
     shs = shs_global + shs_local
+    scs = scs_global + scs_local
 
     # Log probability
-    c = 1
-    factors = [c * rv.logpt for rv in rvs] + \
-              [c * rv.logpt for rv in observed_RVs] + \
+    factors = [sc * rv.logpt for sc, rv in zip(scs, rvs)] + \
+              [rv[1] * rv[0].logpt for rv in observed_RVs.items()] + \
               model.potentials
     logp = tt.add(*map(tt.sum, factors))
 
     # ELBO wrt variational parameters
-    elbo = _elbo_t(logp, uws, rvs, shs, n_mcsamples, random_seed)
+    elbo = _elbo_t(logp, uws, rvs, shs, scs, n_mcsamples, random_seed)
 
     # Replace input shared variables with tensors
     def is_shared(t):
@@ -401,9 +453,10 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     elbo = theano.clone(elbo, replaces, strict=False)
 
     # Create parameter update function used in the training loop
-    params = encoder_params + \
-             [uw[0] for uw in uws_global] + \
-             [uw[1] for uw in uws_global]
+    # params = encoder_params + \
+    #          [uw[0] for uw in uws_global] + \
+    #          [uw[1] for uw in uws_global]
+    params = encoder_params + _flatten(uws_global)
     updates = OrderedDict(optimizer(loss=-1 * elbo, param=params))
     f = theano.function(tensors, elbo, updates=updates, mode=mode)
 
@@ -426,7 +479,7 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     # Variational parameters of global RVs
     us = OrderedDict([(rv.name, uw[0].get_value().copy())
                       for rv, uw in zip(rvs_global, uws_global)])
-    ws = OrderedDict([(rv.name, uw[1].get_value().copy())
+    ws = OrderedDict([(rv.name, np.exp(uw[1].get_value()))
                       for rv, uw in zip(rvs_global, uws_global)])
 
     return ADVIFit(us, ws, elbos)
