@@ -15,6 +15,9 @@ from ..theanof import floatX
 
 from tqdm import trange
 
+from .normalizing_flows import apply_normalizing_flows
+from .utils import get_transformed
+
 __all__ = ['advi', 'sample_vp']
 
 ADVIFit = namedtuple('ADVIFit', 'means, stds, elbo_vals')
@@ -325,8 +328,8 @@ def adagrad_optimizer(learning_rate, epsilon, n_win=10):
 
 
 def sample_vp(
-        vparams, draws=1000, model=None, local_RVs=None, random_seed=None,
-        hide_transformed=True, progressbar=True):
+        vparams, draws=1000, model=None, local_RVs=None, normalizing_flows=[],
+        random_seed=None, hide_transformed=True, progressbar=True):
     """Draw samples from variational posterior.
 
     Parameters
@@ -355,10 +358,10 @@ def sample_vp(
             'stds': vparams.stds
         }
 
-    ds = model.deterministics
+    # ds = model.deterministics
 
-    def get_transformed(v):
-        return v if v not in ds else v.transformed
+    # def get_transformed(v):
+    #     return v if v not in ds else v.transformed
 
     def rvs(x):
         return [get_transformed(v) for v in x] if x is not None else []
@@ -388,8 +391,10 @@ def sample_vp(
     def shprod(sh):
         return 1 if sh == () else tt.prod(sh)
     ns = [r.normal(size=(shprod(sh),)) for sh in shs]
-    replaces = {rv: (n * tt.exp(uw[1]) + uw[0]).reshape(sh)
-                for rv, n, uw, sh in zip(rvs, ns, uws, shs)}
+    zs = [(n * tt.exp(uw[1]) + uw[0]).reshape(sh)
+          for n, uw, sh in zip(ns, uws, shs)]
+    zs = apply_normalizing_flows(zs, rvs, normalizing_flows, return_elbo=False)
+    replaces = {rv: z for rv, z in zip(rvs, zs)}
 
     # Replace the nodes of the graph with variational distributions
     vars = model.free_RVs

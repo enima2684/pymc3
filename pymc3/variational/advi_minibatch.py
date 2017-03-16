@@ -1,5 +1,4 @@
 from collections import OrderedDict
-from itertools import chain
 import numpy as np
 import theano
 import theano.tensor as tt
@@ -10,12 +9,12 @@ import tqdm
 import pymc3 as pm
 from pymc3.theanof import inputvars, floatX
 from .advi import ADVIFit, adagrad_optimizer, gen_random_state, infmean
+from .normalizing_flows import apply_normalizing_flows
+from .utils import get_transformed, flatten
+
 
 __all__ = ['advi_minibatch']
 
-
-def _flatten(l):
-    return list(chain.from_iterable(l))
 
 def _value_error(cond, str):
     if not cond:
@@ -71,8 +70,12 @@ def _init_vparams(start, rv):
 def shprod(sh):
     return 1 if sh == () else tt.prod(sh)
 
-def _elbo_t(logp, uws, rvs, shs, scs, n_mcsamples, random_seed):
+def _elbo_t(
+    logp, uws, rvs, shs, scs, normalizing_flows, n_mcsamples, random_seed
+    ):
     """Return expression of ELBO approximated with Monte Carlo sampling.
+
+    TODO: Fix comment style
 
     :param logp: Tensor of the log probability of the model.
     :param uws: List of the mean and std of random variables.
@@ -101,6 +104,17 @@ def _elbo_t(logp, uws, rvs, shs, scs, n_mcsamples, random_seed):
     elbo = tt.sum([sc * tt.sum(uw[1].ravel() + 0.5 * normal_const)
                    for sc, uw in zip(scs, uws)])
 
+    # Normalizing flows
+    # NOTE: support only when n_mcsamples = 1
+    for nf in normalizing_flows:
+        nf[1].init(nf[0])
+    zs, elbo_trans = apply_normalizing_flows(
+        [z.reshape(sh) for z, sh in zip(zs, shs)], rvs, normalizing_flows,
+        return_elbo=True
+    )
+    zs = [z.reshape((n_mcsamples, shprod(sh))) for z, sh in zip(zs, shs)]
+    elbo += elbo_trans
+
     # Log probability
     def logp_(*zs):
         return theano.clone(
@@ -119,29 +133,6 @@ def _elbo_t(logp, uws, rvs, shs, scs, n_mcsamples, random_seed):
     return elbo
 
 
-def apply_normalizing_flows(zs, rvs, normalizing_flows, elbo=None):
-    zs_new = OrderedDict([(rv.name, z) for rv, z in zip(rvs, zs)])
-    elbo_new = elbo
-
-    for nf in normalizing_flows:
-        zs_org = [zs_new[rv.name] for rv in nf[0]]
-        zs_trn = nf[1].trans(*zs_org)
-        zs_new.update(
-            OrderedDict(
-                [(rv.name, z_trn) for rv, z_trn in zip(nf[0], zs_trn)]
-            )
-        )
-        if elbo_new is not None:
-            elbo_new += nf[1].ldj(*zs_org)
-
-    nf_params = _flatten([nf[1].get_params() for nf in normalizing_flows])
-
-    if elbo is not None:
-        return list(zs_new), nf_params, elbo_new
-    else:
-        return list(zs_new), nf_params
-
-
 def _normalize_rvs(
     minibatch_RVs, global_RVs, local_RVs, observed_RVs, minibatch_tensors,
     vars, total_size
@@ -150,10 +141,6 @@ def _normalize_rvs(
                                         minibatch_tensors, total_size)
 
     # Replace local_RVs with transformed variables
-    def get_transformed(v):
-        if hasattr(v, 'transformed'):
-            return v.transformed
-        return v
     local_RVs = OrderedDict(
         [(get_transformed(v), (uw, s)) for v, (uw, s) in local_RVs.items()]
     )
@@ -178,7 +165,7 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
                    minibatches=None, global_RVs=None, local_RVs=None,
                    observed_RVs=None, encoder_params=None, total_size=None,
                    optimizer=None, learning_rate=.001, epsilon=.1,
-                   normalizing_flows=None, random_seed=None, mode=None):
+                   normalizing_flows=[], random_seed=None, mode=None):
     """Perform mini-batch ADVI.
 
     This function implements a mini-batch automatic differentiation variational
@@ -311,24 +298,9 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     TODO: fix description below
 
     :code:`normalizing_flows` is a list of the form
-    :code:`(rvs, trans, ldj, params)`, where :code:`rvs` is a list of random
-    variables defined in the model. :code:`trans` is a function that implements
-    a transform: :code:`trans(zs) -> zs_trans`, where
-    :code:`[z.shape == z_trans.shape for z, z_trans in zip(zs, zs_trans)]`
-    is :code:`True` for all elements (RVs).
-    :code:`ldj` is a function that returns the expression of the log determinant
-    given :code:`zss`. :code:`params` is the parameters of the transform.
-    Normalizing flows are applied as follows:
-
-    .. code:: python
-
-        for nf in normalizing_flows:
-            zs_ = zs_dict[rvs[rv.name] for rv in nf[0]]
-            zs_trans = nf[1](*zs_)
-            elbo += nf[2](*zs_)
-            for rv, z_trans in zip(nf[0], zs_trans):
-                zs_dict[rv.name] = 
-            optimized_params += nf[3]
+    :code:`(rvs, nf)`, where :code:`rvs` is a list of random
+    variables defined in the model. :code:`nf` is an instance of a subclass of
+    :code:`pymc3.variational.normalizing_flows.NormalizingFlow`.
 
     The following is a list of example notebooks using advi_minibatch:
 
@@ -450,7 +422,8 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     logp = tt.add(*map(tt.sum, factors))
 
     # ELBO wrt variational parameters
-    elbo = _elbo_t(logp, uws, rvs, shs, scs, n_mcsamples, random_seed)
+    elbo = _elbo_t(logp, uws, rvs, shs, scs, normalizing_flows, n_mcsamples,
+                   random_seed)
 
     # Replace input shared variables with tensors
     def is_shared(t):
@@ -462,7 +435,7 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     elbo = theano.clone(elbo, replaces, strict=False)
 
     # Create parameter update function used in the training loop
-    params = encoder_params + _flatten(uws_global)
+    params = encoder_params + flatten(uws_global)
     updates = OrderedDict(optimizer(loss=-1 * elbo, param=params))
     f = theano.function(tensors, elbo, updates=updates, mode=mode)
 
