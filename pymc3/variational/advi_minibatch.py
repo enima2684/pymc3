@@ -142,6 +142,36 @@ def apply_normalizing_flows(zs, rvs, normalizing_flows, elbo=None):
         return list(zs_new), nf_params
 
 
+def _normalize_rvs(
+    minibatch_RVs, global_RVs, local_RVs, observed_RVs, minibatch_tensors,
+    vars, total_size
+    ):
+    local_RVs, observed_RVs = _get_rvss(minibatch_RVs, local_RVs, observed_RVs,
+                                        minibatch_tensors, total_size)
+
+    # Replace local_RVs with transformed variables
+    def get_transformed(v):
+        if hasattr(v, 'transformed'):
+            return v.transformed
+        return v
+    local_RVs = OrderedDict(
+        [(get_transformed(v), (uw, s)) for v, (uw, s) in local_RVs.items()]
+    )
+
+    # Get global variables
+    grvs = list(set(vars) - set(list(local_RVs) + list(observed_RVs)))
+    if global_RVs is None:
+        global_RVs = OrderedDict({v: 1 for v in grvs})
+    elif len(grvs) != len(global_RVs):
+        _value_error(
+            'global_RVs ({}) must have all global RVs: {}'.format(
+                [v for v in global_RVs], grvs
+            )
+        )
+
+    return global_RVs, local_RVs, observed_RVs
+
+
 @change_flags(compute_test_value='ignore')
 def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
                    minibatch_RVs=None, minibatch_tensors=None,
@@ -377,9 +407,6 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
       Weight Uncertainty in Neural Network. In Proceedings of the 32nd
       International Conference on Machine Learning (ICML-15) (pp. 1613-1622).
     """
-    if encoder_params is None:
-        encoder_params = []
-
     model = pm.modelcontext(model)
     vars = inputvars(vars if vars is not None else model.vars)
     start = start if start is not None else model.test_point
@@ -396,29 +423,11 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     if optimizer is None:
         optimizer = adagrad_optimizer(learning_rate, epsilon)
 
-    # For backward compatibility in how input arguments are given
-    local_RVs, observed_RVs = _get_rvss(minibatch_RVs, local_RVs, observed_RVs,
-                                        minibatch_tensors, total_size)
-
-    # Replace local_RVs with transformed variables
-    def get_transformed(v):
-        if hasattr(v, 'transformed'):
-            return v.transformed
-        return v
-    local_RVs = OrderedDict(
-        [(get_transformed(v), (uw, s)) for v, (uw, s) in local_RVs.items()]
+    # Normalize containers of RVs
+    global_RVs, local_RVs, observed_RVs = _normalize_rvs(
+        minibatch_RVs, global_RVs, local_RVs, observed_RVs, minibatch_tensors,
+        vars, total_size
     )
-
-    # Get global variables
-    grvs = list(set(vars) - set(list(local_RVs) + list(observed_RVs)))
-    if global_RVs is None:
-        global_RVs = OrderedDict({v: 1 for v in grvs})
-    elif len(grvs) != len(global_RVs):
-        _value_error(
-            'global_RVs ({}) must have all global RVs: {}'.format(
-                [v for v in global_RVs], grvs
-            )
-        )
 
     # Unobserved random variables
     rvs_global = [rv for rv in global_RVs.keys()]
@@ -453,9 +462,6 @@ def advi_minibatch(vars=None, start=None, model=None, n=5000, n_mcsamples=1,
     elbo = theano.clone(elbo, replaces, strict=False)
 
     # Create parameter update function used in the training loop
-    # params = encoder_params + \
-    #          [uw[0] for uw in uws_global] + \
-    #          [uw[1] for uw in uws_global]
     params = encoder_params + _flatten(uws_global)
     updates = OrderedDict(optimizer(loss=-1 * elbo, param=params))
     f = theano.function(tensors, elbo, updates=updates, mode=mode)

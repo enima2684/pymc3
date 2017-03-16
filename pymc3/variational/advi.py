@@ -370,25 +370,30 @@ def sample_vp(
         r = MRG_RandomStreams(gen_random_state())
     else:
         r = MRG_RandomStreams(seed=random_seed)
-    updates = {}
-    for v in global_RVs:
-        u = theano.shared(vparams['means'][str(v)]).ravel()
-        w = theano.shared(vparams['stds'][str(v)]).ravel()
-        n = r.normal(size=u.tag.test_value.shape)
-        updates.update({v: (n * w + u).reshape(v.tag.test_value.shape)})
 
-    if local_RVs is not None:
-        for v_, (uw, _) in local_RVs.items():
-            v = get_transformed(v_)
-            u = uw[0].ravel()
-            w = uw[1].ravel()
-            n = r.normal(size=u.tag.test_value.shape)
-            updates.update(
-                {v: (n * w + u).reshape(v.tag.test_value.shape)})
+    def get_uw(name):
+        return (theano.shared(vparams['means'][name]),
+                theano.shared(np.log(vparams['stds'][name])))
 
-    # Replace some nodes of the graph with variational distributions
+    rvs_global = [get_transformed(rv) for rv in global_RVs]
+    uws_global = [get_uw(rv.name) for rv in global_RVs]
+    shs_global = [rv.tag.test_value.shape for rv in global_RVs]
+    rvs_local = [get_transformed(rv) for rv in local_RVs.keys()]
+    uws_local = [(v[0][0].ravel(), v[0][1].ravel()) for v in local_RVs.values()]
+    shs_local = [v[0][0].shape for v in local_RVs.values()]
+    rvs = rvs_global + rvs_local
+    uws = uws_global + uws_local
+    shs = shs_global + shs_local
+
+    def shprod(sh):
+        return 1 if sh == () else tt.prod(sh)
+    ns = [r.normal(size=(shprod(sh),)) for sh in shs]
+    replaces = {rv: (n * tt.exp(uw[1]) + uw[0]).reshape(sh)
+                for rv, n, uw, sh in zip(rvs, ns, uws, shs)}
+
+    # Replace the nodes of the graph with variational distributions
     vars = model.free_RVs
-    samples = theano.clone(vars, updates)
+    samples = theano.clone(vars, replaces)
     f = theano.function([], samples)
 
     # Random variables which will be sampled
@@ -405,7 +410,6 @@ def sample_vp(
     range_ = trange(draws) if progressbar else range(draws)
 
     for _ in range_:
-        # 'point' is like {'var1': np.array(0.1), 'var2': np.array(0.2), ...}
         point = {varname: value for varname, value in zip(varnames, f())}
         trace.record(point)
 
