@@ -328,8 +328,9 @@ def adagrad_optimizer(learning_rate, epsilon, n_win=10):
 
 
 def sample_vp(
-        vparams, draws=1000, model=None, local_RVs=None, normalizing_flows=[],
-        random_seed=None, hide_transformed=True, progressbar=True):
+        vparams, draws=1000, model=None, local_RVs=OrderedDict(), 
+        normalizing_flows=[], random_seed=None, hide_transformed=True,
+        progressbar=True):
     """Draw samples from variational posterior.
 
     Parameters
@@ -358,11 +359,6 @@ def sample_vp(
             'stds': vparams.stds
         }
 
-    # ds = model.deterministics
-
-    # def get_transformed(v):
-    #     return v if v not in ds else v.transformed
-
     def rvs(x):
         return [get_transformed(v) for v in x] if x is not None else []
 
@@ -376,7 +372,7 @@ def sample_vp(
 
     def get_uw(name):
         return (theano.shared(vparams['means'][name]),
-                theano.shared(np.log(vparams['stds'][name])))
+                theano.shared(vparams['stds'][name]))
 
     rvs_global = [get_transformed(rv) for rv in global_RVs]
     uws_global = [get_uw(rv.name) for rv in global_RVs]
@@ -391,7 +387,7 @@ def sample_vp(
     def shprod(sh):
         return 1 if sh == () else tt.prod(sh)
     ns = [r.normal(size=(shprod(sh),)) for sh in shs]
-    zs = [(n * tt.exp(uw[1]) + uw[0]).reshape(sh)
+    zs = [(n * uw[1] + uw[0]).reshape(sh)
           for n, uw, sh in zip(ns, uws, shs)]
     zs = apply_normalizing_flows(zs, rvs, normalizing_flows, return_elbo=False)
     replaces = {rv: z for rv, z in zip(rvs, zs)}
